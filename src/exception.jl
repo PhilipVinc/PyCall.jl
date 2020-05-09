@@ -3,12 +3,64 @@
 
 struct PyJlError <: Exception
     err
-    trace
+    traceback
+
+    # Eventually hold a python backtrace
+    pytraceback
 end
 
+PyJlError(err, trace) = PyJlError(err, trace, nothing)
+PyJlError(e::PyJlError, pytrace) = PyJlError(e.err, e.traceback, pytrace)
+
 function show(io::IO, e::PyJlError)
-    print(io, "(in a Julia function called from Python)\nJULIA: ",
-          showerror_string(e.err, e.trace))
+    println(io, "(in a Julia function called from Python):")
+
+    er = e.err
+    bt = e.traceback
+    io = io
+    bt = scrub_pycall_backtrace(bt)
+    lvl = get(io, :level, 0)
+
+    if er isa PyJlError
+        i = length(bt)
+        i > length(er.trace) || deleteat!(er.trace, i:length(er.trace))
+        io = IOContext(io, :level=>lvl+1)
+        println(io, "----------------------")
+        printstyled(io, "ERROR: "; bold=true, color=Base.error_color())
+    else
+        printstyled(io, "JULIA: "; bold=true, color=Base.error_color())
+    end
+
+
+    showerror(IOContext(io, :limit => true), er, bt, backtrace = bt!==nothing)
+
+    if e.pytraceback !== nothing && !ispynull(e.pytraceback)
+        o = pycall(format_traceback, PyObject, e.pytraceback)
+        if !ispynull(o)
+            println(io)
+            println(io)
+            println(io, "Stacktrace (Python):")
+
+            for s in PyVector{AbstractString}(o)
+                print(io, s)
+            end
+        end
+    end
+
+    if lvl != 0
+        println(io)
+        print(io, "----------------------")
+    end
+end
+
+function scrub_pycall_backtrace(bt)
+    if bt !== nothing && !(bt isa Vector{Any}) # ignore our sentinel value types
+        bt = stacktrace(bt, true)
+        # remove REPL-related frames from interactive printing
+        eval_ind = findlast(frame -> !frame.from_c && frame.func === :_pyjlwrap_call, bt)
+        eval_ind === nothing || deleteat!(bt, eval_ind+1:length(bt))
+    end
+    return bt
 end
 
 
@@ -29,16 +81,16 @@ struct PyError <: Exception
 end
 
 function show(io::IO, e::PyError)
-    print(io, "PyError",
-          isempty(e.msg) ? e.msg : string(" (",e.msg,")"),
-          " ")
+    #print(io, "PyError",
+    #      isempty(e.msg) ? e.msg : string(" (",e.msg,")"),
+    #      " ")
+    print(io, "PyError--")
 
     if ispynull(e.T)
         println(io, "None")
     else
         println(io, pystring(e.T), "\n", pystring(e.val))
     end
-
     if !ispynull(e.traceback)
         o = pycall(format_traceback, PyObject, e.traceback)
         if !ispynull(o)
@@ -129,7 +181,9 @@ function pyerror(msg::AbstractString, ptype::PyObject, pvalue::PyObject, ptraceb
             arg = PyObject(@pycheckn ccall((@pysym :PySequence_GetItem), PyPtr, (PyPtr,Int), args, 0))
             if is_pyjlwrap(arg)
                 jarg = unsafe_pyjlwrap_to_objref(arg)
-                jarg isa PyJlError && return jarg
+                if jarg isa PyJlError
+                    return PyJlError(jarg, ptraceback)
+                end
             end
         end
     end
